@@ -15,8 +15,9 @@ from dotenv import load_dotenv
 
 from odds_fetcher   import fetch_todays_games
 from model          import load_models, predict_all_games, resolve_predictions
-from value_detector import (find_value_bets, summarise_value_bets,
-                             find_contrarian_picks, summarise_contrarian_picks)
+from value_detector  import (find_value_bets, summarise_value_bets,
+                              find_contrarian_picks, summarise_contrarian_picks)
+from player_props    import fetch_player_props, find_prop_value_bets, summarise_prop_bets
 
 
 DATA_DIR = Path("data")
@@ -61,8 +62,13 @@ def run():
     value_bets  = find_value_bets(predictions, games)
     contrarians = find_contrarian_picks(predictions, games)
 
+    # ── Step 3b: Player props ─────────────────────────────────────────────────────
+    print(f"\nStep 3b: Fetching and evaluating player props...")
+    props     = fetch_player_props(odds_key, games)
+    prop_bets = find_prop_value_bets(props, bdl_key)
+
     # ── Step 4: Save picks ────────────────────────────────────────────────────
-    picks_path = _save_picks(date_str, games, predictions, value_bets, contrarians)
+    picks_path = _save_picks(date_str, games, predictions, value_bets, contrarians, prop_bets)
     print(f"\nPicks saved to {picks_path}")
 
     # ── Step 5: Print summary ─────────────────────────────────────────────────
@@ -74,6 +80,9 @@ def run():
 
     print("--- Contrarian picks ---")
     summarise_contrarian_picks(contrarians)
+
+    print("--- Player props ---")
+    summarise_prop_bets(prop_bets)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -101,6 +110,7 @@ def _save_picks(
     predictions: list[dict],
     value_bets:  list[dict],
     contrarians: list[dict],
+    prop_bets:   list[dict] = None,
 ) -> Path:
     picks = {
         "date":          date_str,
@@ -138,6 +148,7 @@ def _save_picks(
             {**c, "correct": None}
             for c in contrarians
         ],
+        "prop_bets": prop_bets or [],
     }
 
     path = DATA_DIR / f"picks_{date_str}.json"

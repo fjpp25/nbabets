@@ -85,10 +85,16 @@ def summarise_value_bets(value_bets: list[dict]) -> None:
                 print(f"       Model:    {bet['model_prob']*100:.1f}%  |  "
                       f"Implied: {bet['implied_prob']*100:.1f}%  |  "
                       f"Edge: {bet['edge']*100:+.1f}%")
-            else:
-                print(f"       Model:    {bet['predicted']:+.1f}  |  "
-                      f"Line: {bet['book_line']:+.1f}  |  "
-                      f"Margin: {bet['edge']:+.1f} pts")
+            elif market_key == "spread":
+                # always show from the perspective of the bet team
+                print(f"       Model predicts: {bet['predicted']:+.1f} pts margin (home team)")
+                print(f"       Book line:      {bet['book_line']:+.1f} (home team)  →  "
+                      f"betting {bet['bet_label']}  |  Disagreement: {abs(bet['edge']):.1f} pts")
+            elif market_key == "totals":
+                direction = "above" if bet["edge"] > 0 else "below"
+                print(f"       Model predicts: {bet['predicted']:.1f} combined pts  "
+                      f"({abs(bet['edge']):.1f} pts {direction} the line)")
+                print(f"       Book line:      {bet['book_line']:.1f}  →  betting {bet['bet_label']}")
 
             print(f"       Simulated: €{bet['simulated_stake']:.2f} stake → "
                   f"€{bet['simulated_return']:.2f} return "
