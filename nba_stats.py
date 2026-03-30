@@ -3,15 +3,23 @@ nba_stats.py
 Fetches team performance data exclusively from balldontlie.io.
 
 Derived stats (all computed from raw game results):
-  - season_win_pct      overall W/L ratio over last LOOKBACK_DAYS days
-  - last_10_win_pct     win% over the last 10 games (hot/cold indicator)
-  - home_win_pct        win% when playing at home
-  - away_win_pct        win% when playing away
-  - avg_point_diff      average margin of victory/defeat (proxy for net rating)
-  - avg_points_for      average points scored per game
-  - avg_points_against  average points conceded per game
-  - recent_form         list of last 5 results [1=win, 0=loss], newest first
-  - rest_days           days since last game
+  H2H model features:
+    season_win_pct, last_10_win_pct, home_win_pct, away_win_pct,
+    avg_point_diff, avg_points_for, avg_points_against,
+    recent_form, rest_days
+
+  Totals model features (additional):
+    avg_total_points      avg combined score per game
+    last_10_avg_total     recent scoring pace
+    avg_points_for_home   scoring at home specifically
+    avg_points_for_away   scoring away specifically
+    over_rate             how often games go over the midpoint total
+
+  Spread model features (additional):
+    avg_point_diff        already in H2H features
+    home_avg_point_diff   point diff in home games only
+    away_avg_point_diff   point diff in away games only
+    last_10_point_diff    recent margin trend
 """
 
 import requests
@@ -20,37 +28,23 @@ from datetime import datetime, timezone, timedelta
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 BALLDONTLIE_BASE = "https://api.balldontlie.io/v1"
-LOOKBACK_DAYS    = 90   # how far back to search for recent games
+LOOKBACK_DAYS    = 90
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
 def get_team_stats(home_team: str, away_team: str, bdl_api_key: str) -> dict:
     """
     Returns a unified stats dict for both teams in a matchup.
+    Includes all features needed for H2H, totals, and spread models.
 
     {
-        "home": { <stats for home team> },
-        "away": { <stats for away team> }
-    }
-
-    Each team block:
-    {
-        "name":               "Boston Celtics",
-        "season_win_pct":     0.71,
-        "last_10_win_pct":    0.80,
-        "home_win_pct":       0.78,   # only home games
-        "away_win_pct":       0.61,   # only away games
-        "avg_point_diff":     +8.3,   # positive = winning by X on average
-        "avg_points_for":     118.4,
-        "avg_points_against": 110.1,
-        "recent_form":        [1,1,0,1,0],
-        "rest_days":          2
+        "home": { <full stats for home team> },
+        "away": { <full stats for away team> }
     }
     """
-    all_teams = _bdl_get_all_teams(bdl_api_key)
-
-    home_bdl  = _find_team(all_teams, home_team)
-    away_bdl  = _find_team(all_teams, away_team)
+    all_teams  = _bdl_get_all_teams(bdl_api_key)
+    home_bdl   = _find_team(all_teams, home_team)
+    away_bdl   = _find_team(all_teams, away_team)
 
     home_games = _bdl_get_recent_games(home_bdl["id"], bdl_api_key)
     away_games = _bdl_get_recent_games(away_bdl["id"], bdl_api_key)
@@ -63,7 +57,6 @@ def get_team_stats(home_team: str, away_team: str, bdl_api_key: str) -> dict:
 
 # ── balldontlie helpers ───────────────────────────────────────────────────────
 def _bdl_get_all_teams(api_key: str) -> list[dict]:
-    """Fetches the full list of NBA teams."""
     resp = requests.get(
         f"{BALLDONTLIE_BASE}/teams",
         headers={"Authorization": api_key},
@@ -74,10 +67,6 @@ def _bdl_get_all_teams(api_key: str) -> list[dict]:
 
 
 def _find_team(teams: list[dict], name: str) -> dict:
-    """
-    Finds a team by full name, city, nickname, or abbreviation.
-    Falls back to fuzzy word matching. Raises ValueError if not found.
-    """
     name_lower = name.lower()
     for t in teams:
         if name_lower in (
@@ -87,7 +76,6 @@ def _find_team(teams: list[dict], name: str) -> dict:
             t["abbreviation"].lower(),
         ):
             return t
-    # fuzzy fallback
     for t in teams:
         if any(word in t["full_name"].lower() for word in name_lower.split() if len(word) > 3):
             return t
@@ -95,10 +83,6 @@ def _find_team(teams: list[dict], name: str) -> dict:
 
 
 def _bdl_get_recent_games(team_id: int, api_key: str) -> list[dict]:
-    """
-    Fetches all completed games for a team in the last LOOKBACK_DAYS days,
-    sorted most-recent first.
-    """
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=LOOKBACK_DAYS)
 
@@ -124,13 +108,16 @@ def _bdl_get_recent_games(team_id: int, api_key: str) -> list[dict]:
 # ── Stats derivation ──────────────────────────────────────────────────────────
 def _summarise_games(team_id: int, games: list[dict]) -> dict:
     """
-    Derives all stats from raw game list. Splits home/away automatically.
+    Derives all stats from raw game list for all three models.
     """
     if not games:
         return _empty_stats()
 
-    all_results, home_results, away_results = [], [], []
-    point_diffs, points_for, points_against = [], [], []
+    all_results,  home_results,  away_results  = [], [], []
+    point_diffs,  home_diffs,    away_diffs    = [], [], []
+    pts_for,      pts_against                  = [], []
+    home_pts_for, away_pts_for                 = [], []
+    total_points                               = []
 
     for g in games:
         is_home    = g["home_team"]["id"] == team_id
@@ -139,31 +126,57 @@ def _summarise_games(team_id: int, games: list[dict]) -> dict:
 
         won  = 1 if team_score > opp_score else 0
         diff = team_score - opp_score
+        tot  = team_score + opp_score
 
         all_results.append(won)
         point_diffs.append(diff)
-        points_for.append(team_score)
-        points_against.append(opp_score)
+        pts_for.append(team_score)
+        pts_against.append(opp_score)
+        total_points.append(tot)
 
         if is_home:
             home_results.append(won)
+            home_diffs.append(diff)
+            home_pts_for.append(team_score)
         else:
             away_results.append(won)
+            away_diffs.append(diff)
+            away_pts_for.append(team_score)
 
     last_date = datetime.fromisoformat(games[0]["date"].replace("Z", "+00:00")).date()
     rest_days = (datetime.now(timezone.utc).date() - last_date).days
     n         = len(all_results)
 
+    # over_rate: how often this team's games exceed the season avg total
+    # useful as a pace proxy — high over_rate = fast-paced team
+    avg_total    = sum(total_points) / n
+    median_total = sorted(total_points)[n // 2]
+    over_rate    = sum(1 for t in total_points if t > median_total) / n
+
     return {
-        "season_win_pct":     _pct(sum(all_results), n),
-        "last_10_win_pct":    _pct(sum(all_results[:10]), min(n, 10)),
-        "home_win_pct":       _pct(sum(home_results), len(home_results)),
-        "away_win_pct":       _pct(sum(away_results), len(away_results)),
-        "avg_point_diff":     round(sum(point_diffs) / n, 2),
-        "avg_points_for":     round(sum(points_for) / n, 2),
-        "avg_points_against": round(sum(points_against) / n, 2),
-        "recent_form":        all_results[:5],
-        "rest_days":          rest_days,
+        # ── H2H features ──────────────────────────────────────────────────────
+        "season_win_pct":       _pct(sum(all_results), n),
+        "last_10_win_pct":      _pct(sum(all_results[:10]), min(n, 10)),
+        "home_win_pct":         _pct(sum(home_results), len(home_results)),
+        "away_win_pct":         _pct(sum(away_results), len(away_results)),
+        "avg_point_diff":       _avg(point_diffs),
+        "avg_points_for":       _avg(pts_for),
+        "avg_points_against":   _avg(pts_against),
+        "recent_form":          all_results[:5],
+        "rest_days":            rest_days,
+
+        # ── Spread features ───────────────────────────────────────────────────
+        "home_avg_point_diff":  _avg(home_diffs),
+        "away_avg_point_diff":  _avg(away_diffs),
+        "last_10_point_diff":   _avg(point_diffs[:10]),
+
+        # ── Totals features ───────────────────────────────────────────────────
+        "avg_total_points":     round(avg_total, 2),
+        "last_10_avg_total":    _avg([g["home_team_score"] + g["visitor_team_score"]
+                                      for g in games[:10]]),
+        "avg_points_for_home":  _avg(home_pts_for),
+        "avg_points_for_away":  _avg(away_pts_for),
+        "over_rate":            round(over_rate, 4),
     }
 
 
@@ -171,17 +184,29 @@ def _pct(wins: int, total: int):
     return round(wins / total, 4) if total > 0 else None
 
 
+def _avg(values: list) -> float | None:
+    return round(sum(values) / len(values), 2) if values else None
+
+
 def _empty_stats() -> dict:
     return {
-        "season_win_pct":     None,
-        "last_10_win_pct":    None,
-        "home_win_pct":       None,
-        "away_win_pct":       None,
-        "avg_point_diff":     None,
-        "avg_points_for":     None,
-        "avg_points_against": None,
-        "recent_form":        [],
-        "rest_days":          None,
+        "season_win_pct":       None,
+        "last_10_win_pct":      None,
+        "home_win_pct":         None,
+        "away_win_pct":         None,
+        "avg_point_diff":       None,
+        "avg_points_for":       None,
+        "avg_points_against":   None,
+        "recent_form":          [],
+        "rest_days":            None,
+        "home_avg_point_diff":  None,
+        "away_avg_point_diff":  None,
+        "last_10_point_diff":   None,
+        "avg_total_points":     None,
+        "last_10_avg_total":    None,
+        "avg_points_for_home":  None,
+        "avg_points_for_away":  None,
+        "over_rate":            None,
     }
 
 

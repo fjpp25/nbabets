@@ -1,5 +1,20 @@
-# Default ignored files
-/shelf/
-/workspace.xml
-# Editor-based HTTP Client requests
-/httpRequests/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Environment — never commit API keys
+.env
+
+# Trained models — binary, reproducible via train.py
+model/*.pkl
+
+# Dry run data — local only
+data/
+
+# IDE
+.idea/
+.vscode/
+*.iml
