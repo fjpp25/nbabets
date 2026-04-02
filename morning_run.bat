@@ -4,7 +4,8 @@
 ::  Run this every morning. It will:
 ::    1. Settle yesterday's results
 ::    2. Show the cumulative report
-::    3. Run today's dry run (picks for tonight's games)
+::    3. Regenerate the HTML dashboard
+::    4. Run today's dry run (picks for tonight's games)
 :: ============================================================
 
 cd /d "%~dp0"
@@ -12,14 +13,14 @@ set PYTHON=.venv\Scripts\python.exe
 
 echo.
 echo ============================================================
-echo   NBA BETTING — MORNING RUN
+echo   NBA BETTING -- MORNING RUN
 echo   %date% %time%
 echo ============================================================
 echo.
 
-:: ── Step 1: Settle yesterday's results ──────────────────────
-echo [1/3] Settling yesterday's results...
-echo ────────────────────────────────────────────────────────────
+:: Step 1: Settle yesterday's results
+echo [1/4] Settling yesterday's results...
+echo ------------------------------------------------------------
 %PYTHON% results_tracker.py
 if errorlevel 1 (
     echo WARNING: results_tracker.py encountered an error.
@@ -27,18 +28,27 @@ if errorlevel 1 (
     echo.
 )
 
-:: ── Step 2: Show cumulative report ──────────────────────────
-echo [2/3] Generating cumulative report...
-echo ────────────────────────────────────────────────────────────
+:: Step 2: Show cumulative report
+echo [2/4] Generating cumulative report...
+echo ------------------------------------------------------------
 %PYTHON% report.py
 if errorlevel 1 (
     echo WARNING: report.py encountered an error.
     echo.
 )
 
-:: ── Step 3: Today's picks ────────────────────────────────────
-echo [3/3] Fetching today's picks...
-echo ────────────────────────────────────────────────────────────
+:: Step 3: Regenerate dashboard
+echo [3/4] Updating dashboard...
+echo ------------------------------------------------------------
+%PYTHON% dashboard.py
+if errorlevel 1 (
+    echo WARNING: dashboard.py encountered an error.
+    echo.
+)
+
+:: Step 4: Today's picks
+echo [4/4] Fetching today's picks...
+echo ------------------------------------------------------------
 %PYTHON% dry_run.py
 if errorlevel 1 (
     echo ERROR: dry_run.py failed. Check your API keys and internet connection.
@@ -47,7 +57,7 @@ if errorlevel 1 (
 
 echo.
 echo ============================================================
-echo   Done! Check data\ for today's picks JSON.
+echo   Done! Open dashboard.html to view your stats.
 echo ============================================================
 echo.
 pause

@@ -11,7 +11,8 @@ For Spread/Totals: edge = difference between predicted line and book line,
 """
 
 from odds_fetcher import (
-    best_h2h_odds, best_spread_odds, best_total_odds, implied_probability
+    best_h2h_odds, best_spread_odds, best_total_odds, implied_probability,
+    pinnacle_h2h_odds, pinnacle_spread, pinnacle_total
 )
 
 
@@ -21,7 +22,10 @@ MIN_CONFIDENCE    = 0.55    # model must be at least 55% confident for H2H
 MIN_SPREAD_MARGIN = 2.0     # model must disagree with book line by 2+ pts
 MIN_TOTAL_MARGIN  = 5.0     # model must disagree with total line by 5+ pts
 MIN_ODDS          = 1.75    # only flag spread/total bets with odds >= this
-SIMULATED_STAKE   = 10.0    # € per bet in the dry run
+SIMULATED_STAKE   = 10.0    # € base stake per bet in the dry run
+BANKROLL          = 1000.0  # simulated bankroll for Kelly sizing
+KELLY_FRACTION    = 0.25    # fractional Kelly (0.25 = quarter Kelly — conservative)
+MAX_BET           = 50.0    # cap per bet regardless of Kelly
 
 PREFERRED_BOOKS = [
     "betclic_fr",
@@ -30,6 +34,67 @@ PREFERRED_BOOKS = [
     "pinnacle",
     "williamhill",
 ]
+
+# ── Risk scoring ──────────────────────────────────────────────────────────────
+RISK_WEIGHTS = {
+    "confidence": 0.25,
+    "volatility": 0.25,
+    "sample":     0.20,
+    "rest":       0.15,
+    "odds":       0.15,
+}
+
+RISK_LABELS = [(0, 30, "LOW"), (31, 60, "MEDIUM"), (61, 100, "HIGH")]
+
+
+def compute_risk_score(
+    model_prob:  float,
+    odds:        float,
+    rest_days:   int   = 2,
+    volatility:  float = None,
+    sample_size: int   = 10,
+) -> dict:
+    """Returns {"score": int, "label": str, "components": dict}"""
+    confidence_risk = (1 - abs(model_prob - 0.5) * 2) * 100
+    volatility_risk = min(volatility / 15.0 * 100, 100) if volatility is not None else 50
+    sample_risk     = max(0, min(100, (10 - sample_size) / 6 * 100))
+    rest_risk       = max(0, min(100, (2 - min(rest_days, 2)) / 2 * 100))
+    odds_risk       = min(100, max(0, (odds - 1.5) / 2.0 * 100))
+
+    components = {
+        "confidence": round(confidence_risk, 1),
+        "volatility": round(volatility_risk, 1),
+        "sample":     round(sample_risk, 1),
+        "rest":       round(rest_risk, 1),
+        "odds":       round(odds_risk, 1),
+    }
+    score = round(min(100, max(0, sum(components[k] * RISK_WEIGHTS[k] for k in components))))
+    label = next(lbl for lo, hi, lbl in RISK_LABELS if lo <= score <= hi)
+    return {"score": score, "label": label, "components": components}
+
+
+def kelly_stake(model_prob: float, decimal_odds: float) -> float:
+    """
+    Computes a fractional Kelly stake.
+
+    Kelly formula: f = (bp - q) / b
+      where b = decimal_odds - 1 (net odds)
+            p = model probability of winning
+            q = 1 - p
+
+    We use quarter-Kelly for safety and cap at MAX_BET.
+    Returns the recommended stake in euros.
+    """
+    b = decimal_odds - 1
+    p = model_prob
+    q = 1 - p
+    if b <= 0 or p <= 0:
+        return SIMULATED_STAKE
+    full_kelly = (b * p - q) / b
+    if full_kelly <= 0:
+        return SIMULATED_STAKE   # no edge, use base stake
+    stake = BANKROLL * KELLY_FRACTION * full_kelly
+    return round(min(max(stake, SIMULATED_STAKE), MAX_BET), 2)
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
@@ -82,8 +147,9 @@ def summarise_value_bets(value_bets: list[dict]) -> None:
             print(f"       Odds:     {bet['best_odds']} ({bet['bookmaker']})")
 
             if market_key == "h2h":
+                ref = f" [{bet.get('ref_source','consensus')}]"
                 print(f"       Model:    {bet['model_prob']*100:.1f}%  |  "
-                      f"Implied: {bet['implied_prob']*100:.1f}%  |  "
+                      f"Implied: {bet['implied_prob']*100:.1f}%{ref}  |  "
                       f"Edge: {bet['edge']*100:+.1f}%")
             elif market_key == "spread":
                 # always show from the perspective of the bet team
@@ -99,6 +165,10 @@ def summarise_value_bets(value_bets: list[dict]) -> None:
             print(f"       Simulated: €{bet['simulated_stake']:.2f} stake → "
                   f"€{bet['simulated_return']:.2f} return "
                   f"(€{bet['simulated_profit']:+.2f} if correct)")
+            risk_score = bet.get("risk_score")
+            risk_label = bet.get("risk_label", "—")
+            if risk_score is not None:
+                print(f"       Risk:      {risk_score}/100 ({risk_label})")
             print(f"       Confidence: {bet['confidence'].upper()}")
 
     total_staked = sum(b["simulated_stake"]  for b in value_bets)
@@ -180,18 +250,33 @@ def _evaluate_h2h(pred: dict, odds_game: dict) -> list[dict]:
         if not best_odds:
             continue
 
-        home_odds, _ = best_h2h_odds(odds_game, pred["home_team"])
-        away_odds, _ = best_h2h_odds(odds_game, pred["away_team"])
-        if not home_odds or not away_odds:
-            continue
-
-        fair_home, fair_away = _remove_vig(home_odds, away_odds)
+        # Use Pinnacle as reference (sharpest market), fall back to consensus
+        pin_home, pin_away = pinnacle_h2h_odds(odds_game, team)
+        if pin_home and pin_away:
+            fair_home, fair_away = _remove_vig(pin_home, pin_away)
+            ref_source = "Pinnacle"
+        else:
+            home_odds, _ = best_h2h_odds(odds_game, pred["home_team"])
+            away_odds, _ = best_h2h_odds(odds_game, pred["away_team"])
+            if not home_odds or not away_odds:
+                continue
+            fair_home, fair_away = _remove_vig(home_odds, away_odds)
+            ref_source = "consensus"
         implied_prob = fair_home if team == pred["home_team"] else fair_away
         edge = model_prob - implied_prob
 
         if edge < MIN_EDGE:
             continue
 
+        home_rest = pred["features"].get("home_rest_days", 2)
+        away_rest = pred["features"].get("away_rest_days", 2)
+        team_rest = home_rest if team == pred["home_team"] else away_rest
+        risk = compute_risk_score(
+            model_prob=model_prob,
+            odds=best_odds,
+            rest_days=int(team_rest),
+        )
+        stake = kelly_stake(model_prob, best_odds)
         bets.append({
             "market":           "h2h",
             "game":             f"{pred['away_team']} @ {pred['home_team']}",
@@ -200,13 +285,17 @@ def _evaluate_h2h(pred: dict, odds_game: dict) -> list[dict]:
             "bet_team":         team,
             "model_prob":       round(model_prob, 4),
             "implied_prob":     round(implied_prob, 4),
+            "ref_source":       ref_source,
             "edge":             round(edge, 4),
             "best_odds":        best_odds,
             "bookmaker":        book,
-            "simulated_stake":  SIMULATED_STAKE,
-            "simulated_return": round(SIMULATED_STAKE * best_odds, 2),
-            "simulated_profit": round(SIMULATED_STAKE * best_odds - SIMULATED_STAKE, 2),
+            "simulated_stake":  stake,
+            "simulated_return": round(stake * best_odds, 2),
+            "simulated_profit": round(stake * best_odds - stake, 2),
             "confidence":       pred["h2h"]["confidence"],
+            "risk_score":       risk["score"],
+            "risk_label":       risk["label"],
+            "risk_components":  risk["components"],
             "outcome":          None,
             "actual_pnl":       None,
         })
@@ -241,9 +330,20 @@ def _evaluate_spread(pred: dict, odds_game: dict) -> dict | None:
         bet_label = f"{pred['away_team']} {away_spread:+.1f}"
         best_odds, best_line, book = best_spread_odds(odds_game, pred["away_team"])
 
-    if not best_odds or best_odds < MIN_ODDS:
+    MAX_SPREAD_ODDS = 2.60
+    if not best_odds or best_odds < MIN_ODDS or best_odds > MAX_SPREAD_ODDS:
         return None
 
+    home_rest = pred["features"].get("home_rest_days", 2)
+    away_rest = pred["features"].get("away_rest_days", 2)
+    bet_rest  = home_rest if bet_team == pred["home_team"] else away_rest
+    model_prob = max(pred["h2h"]["home_win_prob"], pred["h2h"]["away_win_prob"])
+    risk = compute_risk_score(
+        model_prob=model_prob,
+        odds=best_odds,
+        rest_days=int(bet_rest),
+    )
+    stake = kelly_stake(model_prob, best_odds)
     return {
         "market":           "spread",
         "game":             f"{pred['away_team']} @ {pred['home_team']}",
@@ -255,10 +355,13 @@ def _evaluate_spread(pred: dict, odds_game: dict) -> dict | None:
         "edge":             round(edge, 1),
         "best_odds":        best_odds,
         "bookmaker":        book,
-        "simulated_stake":  SIMULATED_STAKE,
-        "simulated_return": round(SIMULATED_STAKE * best_odds, 2),
-        "simulated_profit": round(SIMULATED_STAKE * best_odds - SIMULATED_STAKE, 2),
+        "simulated_stake":  stake,
+        "simulated_return": round(stake * best_odds, 2),
+        "simulated_profit": round(stake * best_odds - stake, 2),
         "confidence":       pred["h2h"]["confidence"],
+        "risk_score":       risk["score"],
+        "risk_label":       risk["label"],
+        "risk_components":  risk["components"],
         "outcome":          None,
         "actual_pnl":       None,
     }
@@ -282,6 +385,16 @@ def _evaluate_total(pred: dict, odds_game: dict) -> dict | None:
     if not best_odds or best_odds < MIN_ODDS:
         return None
 
+    home_rest  = pred["features"].get("home_rest_days", 2)
+    away_rest  = pred["features"].get("away_rest_days", 2)
+    avg_rest   = (home_rest + away_rest) / 2
+    model_prob = max(pred["h2h"]["home_win_prob"], pred["h2h"]["away_win_prob"])
+    risk = compute_risk_score(
+        model_prob=model_prob,
+        odds=best_odds,
+        rest_days=int(avg_rest),
+    )
+    stake = kelly_stake(model_prob, best_odds)
     return {
         "market":           "totals",
         "game":             f"{pred['away_team']} @ {pred['home_team']}",
@@ -293,10 +406,13 @@ def _evaluate_total(pred: dict, odds_game: dict) -> dict | None:
         "edge":             round(margin, 1),
         "best_odds":        best_odds,
         "bookmaker":        book,
-        "simulated_stake":  SIMULATED_STAKE,
-        "simulated_return": round(SIMULATED_STAKE * best_odds, 2),
-        "simulated_profit": round(SIMULATED_STAKE * best_odds - SIMULATED_STAKE, 2),
+        "simulated_stake":  stake,
+        "simulated_return": round(stake * best_odds, 2),
+        "simulated_profit": round(stake * best_odds - stake, 2),
         "confidence":       pred["h2h"]["confidence"],
+        "risk_score":       risk["score"],
+        "risk_label":       risk["label"],
+        "risk_components":  risk["components"],
         "outcome":          None,
         "actual_pnl":       None,
     }

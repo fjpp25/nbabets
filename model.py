@@ -13,7 +13,8 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timezone
 
-from nba_stats import _summarise_games, _bdl_get_all_teams, _find_team, _bdl_get_recent_games
+from nba_stats   import _summarise_games, _bdl_get_all_teams, _find_team, _bdl_get_recent_games
+from injuries    import get_injury_report, get_team_injury_impact, apply_injury_adjustments
 
 
 MODEL_DIR = Path("model")
@@ -46,6 +47,7 @@ def predict_game(
     models:        dict,
     total_line:    float = None,
     spread_line:   float = None,
+    injury_report: list  = None,
 ) -> dict:
     """
     Predicts all three markets for a single matchup.
@@ -79,38 +81,176 @@ def predict_game(
         "features": { ... }
     }
     """
-    home_stats, away_stats, feature_dict = _build_stats(
+    home_stats, away_stats, feature_dict, home_team_id, away_team_id = _build_stats(
         home_team, away_team, bdl_api_key
     )
 
+    h2h_pred    = _predict_h2h(home_stats, away_stats, models["h2h"])
+    spread_pred = _predict_spread(home_stats, away_stats, models["spread"], spread_line)
+    totals_pred = _predict_totals(home_stats, away_stats, models["totals"], total_line)
+
+    # back-to-back penalty — second night of b2b reduces win prob and expected scoring
+    home_b2b = home_stats.get("is_b2b", False)
+    away_b2b = away_stats.get("is_b2b", False)
+    B2B_WIN_PENALTY   = 0.03   # 3% win prob reduction for b2b team
+    B2B_TOTAL_PENALTY = 3.0    # 3 fewer points expected in a b2b game per team
+
+    if home_b2b or away_b2b:
+        home_prob = h2h_pred["home_win_prob"]
+        away_prob = h2h_pred["away_win_prob"]
+        if home_b2b:
+            home_prob -= B2B_WIN_PENALTY
+        if away_b2b:
+            away_prob -= B2B_WIN_PENALTY
+        # renormalise
+        total = home_prob + away_prob
+        h2h_pred["home_win_prob_b2b_raw"] = h2h_pred["home_win_prob"]
+        h2h_pred["away_win_prob_b2b_raw"] = h2h_pred["away_win_prob"]
+        h2h_pred["home_win_prob"] = round(home_prob / total, 4)
+        h2h_pred["away_win_prob"] = round(away_prob / total, 4)
+        h2h_pred["predicted_winner"] = "home" if h2h_pred["home_win_prob"] >= 0.5 else "away"
+        h2h_pred["confidence"] = _confidence_label(h2h_pred["home_win_prob"])
+        # totals: b2b games tend to be lower scoring
+        b2b_total_adj = (B2B_TOTAL_PENALTY if home_b2b else 0) + (B2B_TOTAL_PENALTY if away_b2b else 0)
+        if totals_pred.get("predicted_total"):
+            totals_pred["predicted_total"] = round(
+                totals_pred["predicted_total"] - b2b_total_adj, 1
+            )
+            if totals_pred.get("book_total"):
+                totals_pred["margin"] = round(
+                    totals_pred["predicted_total"] - totals_pred["book_total"], 1
+                )
+                totals_pred["prediction"] = (
+                    "Over" if totals_pred["predicted_total"] > totals_pred["book_total"]
+                    else "Under"
+                )
+        h2h_pred["b2b_flag"] = {
+            "home_b2b": home_b2b,
+            "away_b2b": away_b2b,
+        }
+
+    # apply injury adjustments if report available
+    injury_impact   = None
+    injury_affected = False
+    injury_summary  = {}
+
+    if injury_report is not None:
+        try:
+            # reuse team IDs already fetched in _build_stats — no extra API call
+            if home_team_id and away_team_id:
+                injury_impact = get_team_injury_impact(
+                    home_team_id, away_team_id, injury_report, bdl_api_key
+                )
+                if (injury_impact["home"]["adjustment"] != 0.0 or
+                        injury_impact["away"]["adjustment"] != 0.0):
+                    adj_home, adj_away = apply_injury_adjustments(
+                        h2h_pred["home_win_prob"],
+                        h2h_pred["away_win_prob"],
+                        injury_impact,
+                    )
+                    # preserve original raw probs
+                    h2h_pred["home_win_prob_raw"] = h2h_pred["home_win_prob"]
+                    h2h_pred["away_win_prob_raw"] = h2h_pred["away_win_prob"]
+                    h2h_pred["home_win_prob"]     = adj_home
+                    h2h_pred["away_win_prob"]     = adj_away
+                    h2h_pred["predicted_winner"]  = "home" if adj_home >= 0.5 else "away"
+                    h2h_pred["confidence"]        = _confidence_label(adj_home)
+
+                injury_affected = (
+                    injury_impact["home"]["affected"] or
+                    injury_impact["away"]["affected"]
+                )
+
+                # adjust totals prediction for missing scorers
+                home_pts_adj = injury_impact["home"].get("pts_adjustment", 0.0)
+                away_pts_adj = injury_impact["away"].get("pts_adjustment", 0.0)
+                total_pts_adj = home_pts_adj + away_pts_adj
+                if total_pts_adj != 0.0 and totals_pred.get("predicted_total"):
+                    raw_total = totals_pred["predicted_total"]
+                    adj_total = round(raw_total + total_pts_adj, 1)
+                    totals_pred["predicted_total_raw"] = raw_total
+                    totals_pred["predicted_total"]     = adj_total
+                    totals_pred["injury_pts_adj"]       = round(total_pts_adj, 2)
+                    # recalculate over/under vs book line
+                    if totals_pred.get("book_total"):
+                        margin = round(adj_total - totals_pred["book_total"], 1)
+                        totals_pred["margin"]     = margin
+                        totals_pred["prediction"] = "Over" if adj_total > totals_pred["book_total"] else "Under"
+
+                injury_summary = {
+                    "home_adjustment":     injury_impact["home"]["adjustment"],
+                    "away_adjustment":     injury_impact["away"]["adjustment"],
+                    "home_pts_adjustment": home_pts_adj,
+                    "away_pts_adjustment": away_pts_adj,
+                    "total_pts_adjustment":total_pts_adj,
+                    "home_injuries":       injury_impact["home"]["injuries"],
+                    "away_injuries":       injury_impact["away"]["injuries"],
+                }
+        except Exception as e:
+            pass   # injuries are non-critical, never crash prediction
+
     return {
-        "home_team": home_team,
-        "away_team": away_team,
-        "h2h":       _predict_h2h(home_stats, away_stats, models["h2h"]),
-        "spread":    _predict_spread(home_stats, away_stats, models["spread"], spread_line),
-        "totals":    _predict_totals(home_stats, away_stats, models["totals"], total_line),
-        "features":  feature_dict,
+        "home_team":        home_team,
+        "away_team":        away_team,
+        "h2h":              h2h_pred,
+        "spread":           spread_pred,
+        "totals":           totals_pred,
+        "features":         feature_dict,
+        "injury_affected":  injury_affected,
+        "injury_summary":   injury_summary,
     }
 
 
 def predict_all_games(
-    games:       list[dict],
-    bdl_api_key: str,
-    models:      dict,
+    games:         list[dict],
+    bdl_api_key:   str,
+    models:        dict,
+    injury_report: list = None,
 ) -> list[dict]:
     """
     Runs predictions for all of today's games.
-    Games should include consensus_spread and consensus_total from odds_fetcher.
-    Returns predictions sorted by H2H confidence (most confident first).
+    Pre-warms all balldontlie caches BEFORE fetching injuries to avoid
+    rate limit collisions between game fetches and PPG lookups.
     """
-    from odds_fetcher import consensus_spread, consensus_total
+    from odds_fetcher import pinnacle_spread, pinnacle_total
 
+    # ── Phase 1: pre-warm all team/game caches ────────────────────────────────
+    # Fetch teams list + all team game histories FIRST so they are cached.
+    # This way the injury PPG lookups (Phase 2) don't compete with game fetches.
+    print("  Pre-warming stats cache...", end=" ", flush=True)
+    try:
+        all_teams = _bdl_get_all_teams(bdl_api_key)
+        team_ids  = set()
+        for game in games:
+            home_bdl = _find_team(all_teams, game["home_team"])
+            away_bdl = _find_team(all_teams, game["away_team"])
+            if home_bdl: team_ids.add(home_bdl["id"])
+            if away_bdl: team_ids.add(away_bdl["id"])
+        for tid in team_ids:
+            _bdl_get_recent_games(tid, bdl_api_key)
+        print(f"{len(team_ids)} teams cached")
+    except Exception as e:
+        print(f"warning ({e})")
+
+    # ── Phase 2: fetch injury report (uses PPG lookups) ───────────────────────
+    if injury_report is None:
+        print("  Fetching injury report...", end=" ", flush=True)
+        try:
+            injury_report = get_injury_report(bdl_api_key)
+            print(f"{len(injury_report)} players listed")
+        except Exception as e:
+            print(f"failed ({e}) — proceeding without injury data")
+            injury_report = []
+    else:
+        print(f"  Using pre-fetched injury report ({len(injury_report)} players)")
+
+    # ── Phase 3: run predictions (all from cache, no new API calls) ───────────
     predictions = []
     for game in games:
         print(f"  Predicting: {game['away_team']} @ {game['home_team']}...", end=" ")
         try:
-            total_line  = consensus_total(game)
-            spread_line = consensus_spread(game, game["home_team"])
+            total_line  = pinnacle_total(game)
+            spread_line = pinnacle_spread(game, game["home_team"])
             pred = predict_game(
                 game["home_team"],
                 game["away_team"],
@@ -118,6 +258,7 @@ def predict_all_games(
                 models,
                 total_line=total_line,
                 spread_line=spread_line,
+                injury_report=injury_report,
             )
             predictions.append(pred)
             h2h     = pred["h2h"]
@@ -125,7 +266,12 @@ def predict_all_games(
             prob    = max(h2h["home_win_prob"], h2h["away_win_prob"])
             total_p = pred["totals"]["predicted_total"]
             margin  = pred["spread"]["predicted_margin"]
-            print(f"{winner} ({prob:.0%}) | margin: {margin:+.1f} | total: {total_p:.1f}")
+            b2b = pred["h2h"].get("b2b_flag", {})
+            b2b_str  = ""
+            if b2b.get("home_b2b"): b2b_str = f" B2B({pred['home_team'].split()[-1]})"
+            if b2b.get("away_b2b"): b2b_str = f" B2B({pred['away_team'].split()[-1]})"
+            inj_flag = (" ⚠" if pred.get("injury_affected") else "") + b2b_str
+            print(f"{winner} ({prob:.0%}) | margin: {margin:+.1f} | total: {total_p:.1f}{inj_flag}")
         except Exception as e:
             print(f"FAILED — {e}")
 
@@ -229,7 +375,7 @@ def _build_stats(
         "away_" + k: v for k, v in away_stats.items() if k != "recent_form"
     })
 
-    return home_stats, away_stats, feature_dict
+    return home_stats, away_stats, feature_dict, home_bdl["id"], away_bdl["id"]
 
 
 def _h2h_features(h: dict, a: dict) -> list:

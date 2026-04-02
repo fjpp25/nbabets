@@ -5,6 +5,7 @@ picks JSON file with actual outcomes across all three markets:
   - H2H      (who won)
   - Spread   (did the predicted team cover)
   - Totals   (did the game go over or under)
+  - Props    (did the player hit the stat line)
 
 Run each morning after games have finished.
 
@@ -23,7 +24,7 @@ from dotenv import load_dotenv
 
 
 DATA_DIR         = Path("data")
-BALLDONTLIE_BASE = "https://api.balldontlie.io/v1"
+BALLDONTLIE_BASE = "https://api.balldontlie.io"
 ET_OFFSET        = timedelta(hours=-5)
 
 
@@ -80,34 +81,30 @@ def run(date_str: str = None):
         if pred["h2h_correct"]:
             h2h_correct += 1
 
-        # Spread — did the home team cover?
-        # home covers if actual_margin > -book_line
-        # e.g. home -5.5: covers if wins by 6+
-        # e.g. home +5.5: covers if loses by 5 or less (or wins)
+        # Spread
         pred["spread_actual_margin"] = actual_margin
         if pred["spread_book_line"] is not None:
-            home_covered = actual_margin > (-pred["spread_book_line"])
-            model_said_home_covers = pred["spread_covers"]
+            home_covered           = actual_margin > (-pred["spread_book_line"])
             pred["spread_covered"] = home_covered
-            pred["spread_correct"] = (home_covered == model_said_home_covers)
+            pred["spread_correct"] = (home_covered == pred["spread_covers"])
             if pred["spread_correct"]:
                 spread_correct += 1
 
         # Totals
         pred["total_actual"] = actual_total
         if pred["total_book_line"] is not None:
-            went_over = actual_total > pred["total_book_line"]
+            went_over           = actual_total > pred["total_book_line"]
             pred["total_went_over"] = went_over
             pred["total_correct"]   = (
-                (went_over and pred["total_prediction"] == "Over") or
+                (went_over     and pred["total_prediction"] == "Over") or
                 (not went_over and pred["total_prediction"] == "Under")
             )
             if pred["total_correct"]:
                 total_correct += 1
 
     # ── Settle value bets ─────────────────────────────────────────────────────
-    total_staked = 0.0
-    total_pnl    = 0.0
+    vb_staked = 0.0
+    vb_pnl    = 0.0
 
     for vb in picks["value_bets"]:
         parts     = vb["game"].split(" @ ")
@@ -117,8 +114,8 @@ def run(date_str: str = None):
         if not result:
             continue
 
-        actual_home  = result["home_team_score"]
-        actual_away  = result["visitor_team_score"]
+        actual_home   = result["home_team_score"]
+        actual_away   = result["visitor_team_score"]
         actual_margin = actual_home - actual_away
         actual_total  = actual_home + actual_away
 
@@ -128,15 +125,12 @@ def run(date_str: str = None):
                              if actual_margin > 0
                              else result["visitor_team"]["full_name"])
             won = _names_match(actual_winner, vb["bet_team"])
-
         elif vb["market"] == "spread":
-            # check if bet team covered
-            book_line = vb["book_line"]   # from home team's perspective
+            book_line = vb["book_line"]
             if _names_match(vb["bet_team"], home_team):
                 won = actual_margin > (-book_line)
             else:
                 won = actual_margin < (-book_line)
-
         elif vb["market"] == "totals":
             if vb["bet_side"] == "Over":
                 won = actual_total > vb["book_line"]
@@ -144,12 +138,16 @@ def run(date_str: str = None):
                 won = actual_total < vb["book_line"]
 
         vb["outcome"]    = "won" if won else "lost"
-        vb["actual_pnl"] = round(vb["simulated_profit"] if won
-                                 else -vb["simulated_stake"], 2)
-        total_staked    += vb["simulated_stake"]
-        total_pnl       += vb["actual_pnl"]
+        vb["actual_pnl"] = round(vb["simulated_profit"] if won else -vb["simulated_stake"], 2)
+        vb_staked       += vb["simulated_stake"]
+        vb_pnl          += vb["actual_pnl"]
 
-    # ── Settle prop bets ─────────────────────────────────────────────────────────
+    # ── Settle prop bets ──────────────────────────────────────────────────────
+    prop_staked = 0.0
+    prop_pnl    = 0.0
+    prop_won    = 0
+    prop_total  = 0
+
     for pb in picks.get("prop_bets", []):
         if pb.get("actual_value") is not None:
             continue   # already settled
@@ -160,22 +158,20 @@ def run(date_str: str = None):
         if not result:
             continue
 
-        # fetch actual player stat from balldontlie
-        actual = _fetch_player_stat(
-            pb["player"], pb["stat"], result["id"], bdl_key
-        )
+        actual = _fetch_player_stat(pb["player"], pb["stat"], result["id"], bdl_key)
         if actual is None:
             continue
 
         pb["actual_value"] = actual
-        won = (actual > pb["line"] if pb["side"] == "Over"
-               else actual < pb["line"])
+        won = (actual > pb["line"] if pb["side"] == "Over" else actual < pb["line"])
         pb["outcome"]    = "won" if won else "lost"
-        pb["actual_pnl"] = round(
-            pb["simulated_profit"] if won else -pb["simulated_stake"], 2
-        )
-        total_staked += pb["simulated_stake"]
-        total_pnl    += pb["actual_pnl"]
+        pb["actual_pnl"] = round(pb["simulated_profit"] if won else -pb["simulated_stake"], 2)
+
+        prop_staked += pb["simulated_stake"]
+        prop_pnl    += pb["actual_pnl"]
+        prop_total  += 1
+        if won:
+            prop_won += 1
 
     # ── Settle contrarian picks ───────────────────────────────────────────────
     for cp in picks.get("contrarian_picks", []):
@@ -191,17 +187,31 @@ def run(date_str: str = None):
         cp["correct"] = _names_match(actual_winner, cp["model_pick"])
 
     # ── Save summary ──────────────────────────────────────────────────────────
+    total_staked = vb_staked + prop_staked
+    total_pnl    = vb_pnl    + prop_pnl
+
+    # Note: closing line value (CLV) tracking requires fetching odds at tip-off.
+    # opening_odds is saved in each value_bet for future CLV calculation.
     picks["results_summary"] = {
         "settled":              settled,
+        # market prediction accuracy
         "h2h_correct":          h2h_correct,
         "h2h_accuracy":         round(h2h_correct / settled, 4) if settled else None,
         "spread_correct":       spread_correct,
         "spread_accuracy":      round(spread_correct / settled, 4) if settled else None,
         "total_correct":        total_correct,
         "total_accuracy":       round(total_correct / settled, 4) if settled else None,
+        # value bets (team markets only)
         "value_bets_total":     len(picks["value_bets"]),
-        "value_bets_won":       sum(1 for vb in picks["value_bets"]
-                                    if vb.get("outcome") == "won"),
+        "value_bets_won":       sum(1 for vb in picks["value_bets"] if vb.get("outcome") == "won"),
+        "value_bets_staked":    round(vb_staked, 2),
+        "value_bets_pnl":       round(vb_pnl, 2),
+        # prop bets
+        "prop_bets_total":      prop_total,
+        "prop_bets_won":        prop_won,
+        "prop_bets_staked":     round(prop_staked, 2),
+        "prop_bets_pnl":        round(prop_pnl, 2),
+        # combined totals
         "total_staked":         round(total_staked, 2),
         "total_pnl":            round(total_pnl, 2),
         "updated_at":           datetime.now(timezone.utc).isoformat(),
@@ -215,16 +225,13 @@ def run(date_str: str = None):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _fetch_results(date_str: str, api_key: str) -> list[dict]:
-    """Fetches all Final games for a given ET date from balldontlie."""
-    # balldontlie uses UTC dates — fetch both the ET date and the next UTC day
-    # to catch late games that tip off after midnight UTC
     et_date  = datetime.strptime(date_str, "%Y-%m-%d").date()
     utc_next = (et_date + timedelta(days=1)).isoformat()
 
     all_games = []
     for fetch_date in [date_str, utc_next]:
         resp = requests.get(
-            f"{BALLDONTLIE_BASE}/games",
+            f"{BALLDONTLIE_BASE}/nba/v1/games",
             headers={"Authorization": api_key},
             params={"dates[]": fetch_date, "per_page": 30},
             timeout=10,
@@ -232,7 +239,6 @@ def _fetch_results(date_str: str, api_key: str) -> list[dict]:
         resp.raise_for_status()
         all_games.extend([g for g in resp.json()["data"] if g["status"] == "Final"])
 
-    # deduplicate by game id
     seen, unique = set(), []
     for g in all_games:
         if g["id"] not in seen:
@@ -258,16 +264,15 @@ def _names_match(a: str, b: str) -> bool:
 def _fetch_player_stat(
     player_name: str, stat_key: str, game_id: int, api_key: str
 ) -> float | None:
-    """Fetches a player's actual stat line for a specific game."""
     try:
         resp = requests.get(
-            f"{BALLDONTLIE_BASE}/stats",
+            f"{BALLDONTLIE_BASE}/nba/v1/stats",
             headers={"Authorization": api_key},
             params={"game_ids[]": game_id, "per_page": 50},
             timeout=10,
         )
         resp.raise_for_status()
-        stats = resp.json()["data"]
+        stats      = resp.json()["data"]
         name_lower = player_name.lower()
         for s in stats:
             full = f"{s['player']['first_name']} {s['player']['last_name']}".lower()
@@ -291,6 +296,7 @@ def _print_summary(picks: dict, date_str: str) -> None:
         print("  No games settled yet.")
         return
 
+    # ── Market accuracy ───────────────────────────────────────────────────────
     print(f"\n  Market accuracy:")
     print(f"    H2H:    {s['h2h_correct']}/{n}  ({s['h2h_accuracy']*100:.1f}%)")
     if s["spread_accuracy"] is not None:
@@ -298,10 +304,11 @@ def _print_summary(picks: dict, date_str: str) -> None:
     if s["total_accuracy"] is not None:
         print(f"    Totals: {s['total_correct']}/{n}  ({s['total_accuracy']*100:.1f}%)")
 
+    # ── Game-by-game ──────────────────────────────────────────────────────────
     print(f"\n  Game-by-game:")
     for pred in picks["predictions"]:
         if pred.get("h2h_actual_winner"):
-            h = "✓" if pred["h2h_correct"]   else "✗"
+            icon   = "✓" if pred["h2h_correct"] else "✗"
             s_icon = ""
             t_icon = ""
             if pred.get("spread_correct") is not None:
@@ -310,32 +317,63 @@ def _print_summary(picks: dict, date_str: str) -> None:
             if pred.get("total_correct") is not None:
                 t_icon = f"  total {'✓' if pred['total_correct'] else '✗'} " \
                          f"(actual {pred['total_actual']:.0f})"
-            print(f"    {h} {pred['away_team']} @ {pred['home_team']}")
+            print(f"    {icon} {pred['away_team']} @ {pred['home_team']}")
             print(f"      H2H: predicted {pred['h2h_predicted_winner']:20s} "
                   f"actual {pred['h2h_actual_winner']}")
             if s_icon: print(f"     {s_icon}")
             if t_icon: print(f"     {t_icon}")
 
+    # ── Value bets P&L ────────────────────────────────────────────────────────
     if picks["value_bets"]:
         print(f"\n  Value bets P&L:")
-        won_count  = 0
-        lost_count = 0
+        vb_won = vb_lost = 0
         for vb in picks["value_bets"]:
             if vb.get("outcome"):
-                icon = "✓" if vb["outcome"] == "won" else "✗"
+                icon   = "✓" if vb["outcome"] == "won" else "✗"
                 market = vb["market"].upper()
+                risk   = f"  risk {vb['risk_score']}" if vb.get("risk_score") is not None else ""
                 print(f"    {icon} [{market:6s}] {vb['bet_label']:30s} "
-                      f"{vb['outcome'].upper():4s}  €{vb['actual_pnl']:+.2f}")
-                if vb["outcome"] == "won": won_count += 1
-                else: lost_count += 1
+                      f"{vb['outcome'].upper():4s}  €{vb['actual_pnl']:+.2f}{risk}")
+                if vb["outcome"] == "won": vb_won  += 1
+                else:                      vb_lost += 1
 
-        sr = picks["results_summary"]
-        print(f"\n    Record:       {won_count}W / {lost_count}L")
-        print(f"    Total staked: €{sr['total_staked']:.2f}")
-        print(f"    Total P&L:    €{sr['total_pnl']:+.2f}")
-        roi = sr["total_pnl"] / sr["total_staked"] * 100 if sr["total_staked"] else 0
-        print(f"    ROI:          {roi:+.1f}%")
+        print(f"\n    Record:       {vb_won}W / {vb_lost}L")
+        print(f"    Staked:       €{s['value_bets_staked']:.2f}")
+        print(f"    P&L:          €{s['value_bets_pnl']:+.2f}")
+        if s["value_bets_staked"]:
+            roi = s["value_bets_pnl"] / s["value_bets_staked"] * 100
+            print(f"    ROI:          {roi:+.1f}%")
 
+    # ── Prop bets P&L ─────────────────────────────────────────────────────────
+    settled_props = [pb for pb in picks.get("prop_bets", []) if pb.get("outcome")]
+    if settled_props:
+        print(f"\n  Player props P&L:")
+        prop_won = prop_lost = 0
+        for pb in settled_props:
+            icon  = "✓" if pb["outcome"] == "won" else "✗"
+            risk  = f"  risk {pb['risk_score']}" if pb.get("risk_score") is not None else ""
+            print(f"    {icon} [PROPS ] {pb['bet_label']:30s} "
+                  f"{pb['outcome'].upper():4s}  €{pb['actual_pnl']:+.2f}  "
+                  f"actual: {pb['actual_value']:.1f}{risk}")
+            if pb["outcome"] == "won": prop_won  += 1
+            else:                      prop_lost += 1
+
+        print(f"\n    Record:       {prop_won}W / {prop_lost}L")
+        print(f"    Staked:       €{s['prop_bets_staked']:.2f}")
+        print(f"    P&L:          €{s['prop_bets_pnl']:+.2f}")
+        if s["prop_bets_staked"]:
+            roi = s["prop_bets_pnl"] / s["prop_bets_staked"] * 100
+            print(f"    ROI:          {roi:+.1f}%")
+
+    # ── Combined totals ───────────────────────────────────────────────────────
+    if s["total_staked"] > 0:
+        print(f"\n  {'─'*60}")
+        print(f"  Combined total staked: €{s['total_staked']:.2f}")
+        print(f"  Combined total P&L:    €{s['total_pnl']:+.2f}")
+        roi = s["total_pnl"] / s["total_staked"] * 100
+        print(f"  Combined ROI:          {roi:+.1f}%")
+
+    # ── Contrarian picks ──────────────────────────────────────────────────────
     if picks.get("contrarian_picks"):
         correct = sum(1 for cp in picks["contrarian_picks"] if cp.get("correct"))
         total   = sum(1 for cp in picks["contrarian_picks"] if cp.get("correct") is not None)

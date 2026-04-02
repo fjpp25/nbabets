@@ -18,6 +18,7 @@ Approach:
 
 import time
 import requests
+from value_detector import compute_risk_score
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
@@ -71,15 +72,24 @@ def fetch_player_props(odds_api_key: str, games: list[dict]) -> list[dict]:
 
 
 def find_prop_value_bets(
-    props:       list[dict],
-    bdl_api_key: str,
+    props:         list[dict],
+    bdl_api_key:   str,
+    injury_report: list[dict] = None,
 ) -> list[dict]:
     """
     For each prop, fetches the player's recent stats from balldontlie
     and checks if the rolling average beats the MIN_EDGE_PTS threshold.
 
+    Skips props for players listed as Out or Doubtful in the injury report.
     Returns value bets sorted by edge (largest first).
     """
+    # build set of injured player names to skip
+    injured_out = set()
+    if injury_report:
+        for inj in injury_report:
+            if inj.get("status") in {"Out", "Doubtful"}:
+                injured_out.add(inj["player_name"].lower())
+
     # cache player stats to avoid redundant API calls
     player_cache: dict[str, dict] = {}
     value_bets = []
@@ -91,6 +101,10 @@ def find_prop_value_bets(
         player_name = prop["player"]
         market      = prop["market"]
         stat_key    = _market_to_stat(market)
+
+        # skip props for players who are out or doubtful
+        if player_name.lower() in injured_out:
+            continue
 
         # fetch stats once per player
         cache_key = f"{player_name}_{market}"
@@ -127,6 +141,13 @@ def find_prop_value_bets(
         if not best_odds or best_odds < MIN_ODDS:
             continue
 
+        _risk = compute_risk_score(
+            model_prob=0.5 + abs(edge) / (2 * max(abs(edge), 1)),
+            odds=best_odds,
+            rest_days=2,
+            volatility=stats["rolling_std"],
+            sample_size=stats["games"],
+        )
         value_bets.append({
             "market":           "props",
             "prop_market":      market,
@@ -144,6 +165,9 @@ def find_prop_value_bets(
             "edge":             round(abs(edge), 1),
             "best_odds":        best_odds,
             "bookmaker":        prop["bookmaker"],
+            "risk_score":       _risk["score"],
+            "risk_label":       _risk["label"],
+            "risk_components":  _risk["components"],
             "simulated_stake":  SIMULATED_STAKE,
             "simulated_return": round(SIMULATED_STAKE * best_odds, 2),
             "simulated_profit": round(SIMULATED_STAKE * best_odds - SIMULATED_STAKE, 2),
@@ -182,6 +206,10 @@ def summarise_prop_bets(prop_bets: list[dict]) -> None:
             print(f"       Simulated: €{bet['simulated_stake']:.2f} stake → "
                   f"€{bet['simulated_return']:.2f} return "
                   f"(€{bet['simulated_profit']:+.2f} if correct)")
+            risk_score = bet.get("risk_score")
+            risk_label = bet.get("risk_label", "—")
+            if risk_score is not None:
+                print(f"       Risk:      {risk_score}/100 ({risk_label})")
 
     total_staked = sum(b["simulated_stake"]  for b in prop_bets)
     total_return = sum(b["simulated_return"] for b in prop_bets)

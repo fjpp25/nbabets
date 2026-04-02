@@ -56,14 +56,25 @@ def get_team_stats(home_team: str, away_team: str, bdl_api_key: str) -> dict:
 
 
 # ── balldontlie helpers ───────────────────────────────────────────────────────
+_teams_cache: list[dict] = []
+
 def _bdl_get_all_teams(api_key: str) -> list[dict]:
-    resp = requests.get(
-        f"{BALLDONTLIE_BASE}/teams",
-        headers={"Authorization": api_key},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()["data"]
+    global _teams_cache
+    if _teams_cache:
+        return _teams_cache
+    for attempt in range(4):
+        resp = requests.get(
+            f"{BALLDONTLIE_BASE}/teams",
+            headers={"Authorization": api_key},
+            timeout=10,
+        )
+        if resp.status_code == 429:
+            import time; time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        _teams_cache = resp.json()["data"]
+        return _teams_cache
+    raise RuntimeError("Could not fetch teams after retries")
 
 
 def _find_team(teams: list[dict], name: str) -> dict:
@@ -82,27 +93,38 @@ def _find_team(teams: list[dict], name: str) -> dict:
     raise ValueError(f"Team not found in balldontlie: '{name}'")
 
 
+_games_cache: dict[int, list[dict]] = {}
+
 def _bdl_get_recent_games(team_id: int, api_key: str) -> list[dict]:
+    if team_id in _games_cache:
+        return _games_cache[team_id]
+
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=LOOKBACK_DAYS)
 
-    resp = requests.get(
-        f"{BALLDONTLIE_BASE}/games",
-        headers={"Authorization": api_key},
-        params={
-            "team_ids[]": team_id,
-            "start_date": start.isoformat(),
-            "end_date":   today.isoformat(),
-            "per_page":   100,
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
+    for attempt in range(4):
+        resp = requests.get(
+            f"{BALLDONTLIE_BASE}/games",
+            headers={"Authorization": api_key},
+            params={
+                "team_ids[]": team_id,
+                "start_date": start.isoformat(),
+                "end_date":   today.isoformat(),
+                "per_page":   100,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 429:
+            import time; time.sleep(2 ** attempt)
+            continue
+        resp.raise_for_status()
+        games    = resp.json()["data"]
+        finished = [g for g in games if g["status"] == "Final"]
+        finished.sort(key=lambda g: g["date"], reverse=True)
+        _games_cache[team_id] = finished
+        return finished
 
-    games    = resp.json()["data"]
-    finished = [g for g in games if g["status"] == "Final"]
-    finished.sort(key=lambda g: g["date"], reverse=True)
-    return finished
+    raise RuntimeError(f"Could not fetch games for team {team_id} after retries")
 
 
 # ── Stats derivation ──────────────────────────────────────────────────────────
@@ -153,6 +175,8 @@ def _summarise_games(team_id: int, games: list[dict]) -> dict:
     median_total = sorted(total_points)[n // 2]
     over_rate    = sum(1 for t in total_points if t > median_total) / n
 
+    is_b2b = (rest_days == 0)   # back-to-back: played yesterday
+
     return {
         # ── H2H features ──────────────────────────────────────────────────────
         "season_win_pct":       _pct(sum(all_results), n),
@@ -164,6 +188,7 @@ def _summarise_games(team_id: int, games: list[dict]) -> dict:
         "avg_points_against":   _avg(pts_against),
         "recent_form":          all_results[:5],
         "rest_days":            rest_days,
+        "is_b2b":               is_b2b,
 
         # ── Spread features ───────────────────────────────────────────────────
         "home_avg_point_diff":  _avg(home_diffs),

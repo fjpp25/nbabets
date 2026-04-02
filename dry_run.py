@@ -18,6 +18,7 @@ from model          import load_models, predict_all_games, resolve_predictions
 from value_detector  import (find_value_bets, summarise_value_bets,
                               find_contrarian_picks, summarise_contrarian_picks)
 from player_props    import fetch_player_props, find_prop_value_bets, summarise_prop_bets
+from injuries        import get_injury_report
 
 
 DATA_DIR = Path("data")
@@ -53,8 +54,15 @@ def run():
 
     # ── Step 2: Model predictions ─────────────────────────────────────────────
     print(f"\nStep 2: Running model predictions...")
+    print("  Pre-fetching injury report for props filter...", end=" ", flush=True)
+    try:
+        _injury_report = get_injury_report(bdl_key)
+        print(f"{len(_injury_report)} players listed")
+    except Exception:
+        _injury_report = []
+        print("failed — continuing without")
     models      = load_models()
-    predictions = predict_all_games(games, bdl_key, models)
+    predictions = predict_all_games(games, bdl_key, models, injury_report=_injury_report)
     predictions = resolve_predictions(predictions)
 
     # ── Step 3: Value detection ───────────────────────────────────────────────
@@ -65,7 +73,7 @@ def run():
     # ── Step 3b: Player props ─────────────────────────────────────────────────────
     print(f"\nStep 3b: Fetching and evaluating player props...")
     props     = fetch_player_props(odds_key, games)
-    prop_bets = find_prop_value_bets(props, bdl_key)
+    prop_bets = find_prop_value_bets(props, bdl_key, injury_report=_injury_report)
 
     # ── Step 4: Save picks ────────────────────────────────────────────────────
     picks_path = _save_picks(date_str, games, predictions, value_bets, contrarians, prop_bets)
@@ -99,8 +107,41 @@ def _print_predictions(predictions: list[dict]) -> None:
         total    = p["totals"]["predicted_total"]
         ou       = p["totals"].get("prediction") or "—"
         conf     = p["h2h"]["confidence"].upper()
+        b2b      = p["h2h"].get("b2b_flag", {})
+        b2b_str  = ""
+        if b2b.get("home_b2b"): b2b_str = f" B2B({p['home_team'].split()[-1]})"
+        if b2b.get("away_b2b"): b2b_str = f" B2B({p['away_team'].split()[-1]})"
+        inj_flag = (" ⚠" if p.get("injury_affected") else "") + b2b_str
         print(f"  {matchup:<40} {winner:<22} {prob:>5.1%}  "
-              f"{margin:>+7.1f}  {total:>6.1f}  {ou:>5}  {conf}")
+              f"{margin:>+7.1f}  {total:>6.1f}  {ou:>5}  {conf}{inj_flag}")
+
+    # Print injury details for affected games
+    affected = [p for p in predictions if p.get("injury_affected")]
+    if affected:
+        print(f"\n  ⚠ INJURY ALERTS:")
+        for p in affected:
+            s = p.get("injury_summary", {})
+            print(f"\n  {p['away_team']} @ {p['home_team']}")
+            # Home injuries
+            for inj in s.get("home_injuries", []):
+                raw  = p["h2h"].get("home_win_prob_raw", p["h2h"]["home_win_prob"])
+                adj  = p["h2h"]["home_win_prob"]
+                tier = inj["tier"].upper()
+                print(f"    [{tier}] {inj['player_name']:25s} {inj['status']:12s} "
+                      f"({inj['ppg']:.1f} ppg)  adj: {inj['adjustment']:+.1%}")
+            # Away injuries
+            for inj in s.get("away_injuries", []):
+                tier = inj["tier"].upper()
+                print(f"    [{tier}] {inj['player_name']:25s} {inj['status']:12s} "
+                      f"({inj['ppg']:.1f} ppg)  adj: {inj['adjustment']:+.1%}")
+            # Show prob shift
+            home_raw = p["h2h"].get("home_win_prob_raw")
+            if home_raw:
+                home_adj = p["h2h"]["home_win_prob"]
+                away_raw = p["h2h"].get("away_win_prob_raw", 1 - home_raw)
+                away_adj = p["h2h"]["away_win_prob"]
+                print(f"    Prob shift: {p['home_team']} {home_raw:.1%} → {home_adj:.1%}  |  "
+                      f"{p['away_team']} {away_raw:.1%} → {away_adj:.1%}")
     print()
 
 
@@ -125,6 +166,10 @@ def _save_picks(
                 "h2h_home_prob":        p["h2h"]["home_win_prob"],
                 "h2h_away_prob":        p["h2h"]["away_win_prob"],
                 "h2h_confidence":       p["h2h"]["confidence"],
+                "injury_affected":      p.get("injury_affected", False),
+                "injury_summary":       p.get("injury_summary", {}),
+                "h2h_home_prob_raw":    p["h2h"].get("home_win_prob_raw"),
+                "h2h_away_prob_raw":    p["h2h"].get("away_win_prob_raw"),
                 "h2h_actual_winner":    None,
                 "h2h_correct":          None,
                 # Spread
@@ -143,7 +188,10 @@ def _save_picks(
             }
             for p in predictions
         ],
-        "value_bets":  value_bets,
+        "value_bets":  [
+            {**vb, "opening_odds": vb.get("best_odds")}
+            for vb in value_bets
+        ],
         "contrarian_picks": [
             {**c, "correct": None}
             for c in contrarians

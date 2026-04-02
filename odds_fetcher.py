@@ -212,6 +212,58 @@ def implied_probability(decimal_odds: float) -> float:
     return 1 / decimal_odds
 
 
+
+PINNACLE_KEY = "pinnacle"
+
+
+def pinnacle_h2h_odds(game: dict, team: str) -> tuple[Optional[float], Optional[float]]:
+    """
+    Returns (home_odds, away_odds) from Pinnacle specifically.
+    Falls back to (None, None) if Pinnacle isn't available for this game.
+    Used as the reference for H2H edge calculation.
+    """
+    for bm in game["bookmakers"]:
+        if bm["key"] != PINNACLE_KEY:
+            continue
+        h2h = bm["markets"].get("h2h", {})
+        home_odds = next((o for t, o in h2h.items()
+                          if _names_match(t, game["home_team"])), None)
+        away_odds = next((o for t, o in h2h.items()
+                          if _names_match(t, game["away_team"])), None)
+        return home_odds, away_odds
+    return None, None
+
+
+def pinnacle_spread(game: dict, team: str) -> Optional[float]:
+    """
+    Returns Pinnacle's spread line for a team.
+    Falls back to consensus if Pinnacle unavailable.
+    """
+    for bm in game["bookmakers"]:
+        if bm["key"] != PINNACLE_KEY:
+            continue
+        spreads = bm["markets"].get("spreads", {})
+        for t, data in spreads.items():
+            if _names_match(t, team):
+                return data["line"]
+    # fallback to consensus
+    return consensus_spread(game, team)
+
+
+def pinnacle_total(game: dict) -> Optional[float]:
+    """
+    Returns Pinnacle's over/under line.
+    Falls back to consensus if Pinnacle unavailable.
+    """
+    for bm in game["bookmakers"]:
+        if bm["key"] != PINNACLE_KEY:
+            continue
+        totals = bm["markets"].get("totals", {})
+        if "Over" in totals:
+            return totals["Over"]["line"]
+    # fallback to consensus
+    return consensus_total(game)
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _names_match(a: str, b: str) -> bool:
     a_words = {w.lower() for w in a.split() if len(w) > 3}

@@ -30,6 +30,8 @@ def run():
         "h2h_correct": 0, "spread_correct": 0, "total_correct": 0,
         "vb_total": 0, "vb_won": 0,
         "staked": 0.0, "pnl": 0.0,
+        "prop_total": 0, "prop_won": 0,
+        "prop_staked": 0.0, "prop_pnl": 0.0,
         "contrarian_correct": 0, "contrarian_total": 0,
     }
     daily_rows   = []
@@ -52,6 +54,10 @@ def run():
             totals["vb_won"]         += s.get("value_bets_won", 0)
             totals["staked"]         += s.get("total_staked", 0.0)
             totals["pnl"]            += s.get("total_pnl", 0.0)
+            totals["prop_total"]     += s.get("prop_bets_total", 0)
+            totals["prop_won"]       += s.get("prop_bets_won", 0)
+            totals["prop_staked"]    += s.get("prop_bets_staked", 0.0)
+            totals["prop_pnl"]       += s.get("prop_bets_pnl", 0.0)
 
             for cp in picks.get("contrarian_picks", []):
                 if cp.get("correct") is not None:
