@@ -124,52 +124,47 @@ def find_value_bets(predictions: list[dict], games: list[dict]) -> list[dict]:
         if total_bet:
             value_bets.append(total_bet)
 
-    value_bets.sort(key=lambda b: (b["market"], -b.get("edge", 0)))
+    value_bets.sort(key=lambda b: (b.get("risk_score", 50), -abs(b.get("edge", 0))))
     return value_bets
 
 
 def summarise_value_bets(value_bets: list[dict]) -> None:
-    """Prints a formatted summary of all value bets grouped by market."""
+    """Prints value bets sorted by risk score (lowest risk first)."""
     if not value_bets:
         print("  No value bets found today.")
         return
 
-    markets = {"h2h": "MONEYLINE", "spread": "SPREAD", "totals": "TOTALS"}
-    for market_key, market_label in markets.items():
-        bets = [b for b in value_bets if b["market"] == market_key]
-        if not bets:
-            continue
+    market_labels = {"h2h": "MONEYLINE", "spread": "SPREAD", "totals": "TOTALS"}
+    for i, bet in enumerate(value_bets, 1):
+        market_key   = bet["market"]
+        market_label = market_labels.get(market_key, market_key.upper())
+        risk_score   = bet.get("risk_score", "—")
+        risk_label   = bet.get("risk_label", "—")
 
-        print(f"\n  ── {market_label} ({len(bets)} bet(s)) {'─'*40}")
-        for i, bet in enumerate(bets, 1):
-            print(f"\n  #{i}  {bet['game']}")
-            print(f"       Bet:      {bet['bet_label']}")
-            print(f"       Odds:     {bet['best_odds']} ({bet['bookmaker']})")
+        print(f"\n  #{i}  [{market_label}]  {bet['game']}")
+        print(f"       Bet:      {bet['bet_label']}")
+        print(f"       Odds:     {bet['best_odds']} ({bet['bookmaker']})")
 
-            if market_key == "h2h":
-                ref = f" [{bet.get('ref_source','consensus')}]"
-                print(f"       Model:    {bet['model_prob']*100:.1f}%  |  "
-                      f"Implied: {bet['implied_prob']*100:.1f}%{ref}  |  "
-                      f"Edge: {bet['edge']*100:+.1f}%")
-            elif market_key == "spread":
-                # always show from the perspective of the bet team
-                print(f"       Model predicts: {bet['predicted']:+.1f} pts margin (home team)")
-                print(f"       Book line:      {bet['book_line']:+.1f} (home team)  →  "
-                      f"betting {bet['bet_label']}  |  Disagreement: {abs(bet['edge']):.1f} pts")
-            elif market_key == "totals":
-                direction = "above" if bet["edge"] > 0 else "below"
-                print(f"       Model predicts: {bet['predicted']:.1f} combined pts  "
-                      f"({abs(bet['edge']):.1f} pts {direction} the line)")
-                print(f"       Book line:      {bet['book_line']:.1f}  →  betting {bet['bet_label']}")
+        if market_key == "h2h":
+            ref = f" [{bet.get('ref_source','consensus')}]"
+            print(f"       Model:    {bet['model_prob']*100:.1f}%  |  "
+                  f"Implied: {bet['implied_prob']*100:.1f}%{ref}  |  "
+                  f"Edge: {bet['edge']*100:+.1f}%")
+        elif market_key == "spread":
+            print(f"       Model predicts: {bet['predicted']:+.1f} pts margin (home team)")
+            print(f"       Book line:      {bet['book_line']:+.1f} (home team)  →  "
+                  f"betting {bet['bet_label']}  |  Disagreement: {abs(bet['edge']):.1f} pts")
+        elif market_key == "totals":
+            direction = "above" if bet["edge"] > 0 else "below"
+            print(f"       Model predicts: {bet['predicted']:.1f} combined pts  "
+                  f"({abs(bet['edge']):.1f} pts {direction} the line)")
+            print(f"       Book line:      {bet['book_line']:.1f}  →  betting {bet['bet_label']}")
 
-            print(f"       Simulated: €{bet['simulated_stake']:.2f} stake → "
-                  f"€{bet['simulated_return']:.2f} return "
-                  f"(€{bet['simulated_profit']:+.2f} if correct)")
-            risk_score = bet.get("risk_score")
-            risk_label = bet.get("risk_label", "—")
-            if risk_score is not None:
-                print(f"       Risk:      {risk_score}/100 ({risk_label})")
-            print(f"       Confidence: {bet['confidence'].upper()}")
+        print(f"       Simulated: €{bet['simulated_stake']:.2f} stake → "
+              f"€{bet['simulated_return']:.2f} return "
+              f"(€{bet['simulated_profit']:+.2f} if correct)")
+        print(f"       Risk:      {risk_score}/100 ({risk_label})  |  "
+              f"Confidence: {bet['confidence'].upper()}")
 
     total_staked = sum(b["simulated_stake"]  for b in value_bets)
     total_return = sum(b["simulated_return"] for b in value_bets)

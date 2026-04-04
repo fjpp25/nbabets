@@ -102,9 +102,11 @@ def run(date_str: str = None):
             if pred["total_correct"]:
                 total_correct += 1
 
-    # ── Settle value bets ─────────────────────────────────────────────────────
-    vb_staked = 0.0
-    vb_pnl    = 0.0
+    # ── Settle value bets — both suggested (Kelly) and placed (actual) ────────
+    sug_staked = sug_pnl = 0.0
+    sug_won    = sug_total = 0
+    pl_staked  = pl_pnl = 0.0
+    pl_won     = pl_total = 0
 
     for vb in picks["value_bets"]:
         parts     = vb["game"].split(" @ ")
@@ -139,14 +141,33 @@ def run(date_str: str = None):
 
         vb["outcome"]    = "won" if won else "lost"
         vb["actual_pnl"] = round(vb["simulated_profit"] if won else -vb["simulated_stake"], 2)
-        vb_staked       += vb["simulated_stake"]
-        vb_pnl          += vb["actual_pnl"]
 
-    # ── Settle prop bets ──────────────────────────────────────────────────────
-    prop_staked = 0.0
-    prop_pnl    = 0.0
-    prop_won    = 0
-    prop_total  = 0
+        # Suggested (Kelly) track
+        sug_staked += vb["simulated_stake"]
+        sug_pnl    += vb["actual_pnl"]
+        sug_total  += 1
+        if won: sug_won += 1
+
+        # Placed (actual) track
+        if vb.get("placed") and vb.get("placed_stake"):
+            ps  = vb["placed_stake"]
+            po  = vb.get("best_odds", 1.0)
+            pnl = round(ps * po - ps, 2) if won else round(-ps, 2)
+            vb["placed_actual_pnl"] = pnl
+            pl_staked += ps
+            pl_pnl    += pnl
+            pl_total  += 1
+            if won: pl_won += 1
+
+    # keep old field names for backwards compat
+    vb_staked = sug_staked
+    vb_pnl    = sug_pnl
+
+    # ── Settle prop bets — both suggested and placed ─────────────────────────
+    prop_staked = prop_pnl = 0.0
+    prop_won    = prop_total = 0
+    prop_pl_staked = prop_pl_pnl = 0.0
+    prop_pl_won    = prop_pl_total = 0
 
     for pb in picks.get("prop_bets", []):
         if pb.get("actual_value") is not None:
@@ -170,8 +191,18 @@ def run(date_str: str = None):
         prop_staked += pb["simulated_stake"]
         prop_pnl    += pb["actual_pnl"]
         prop_total  += 1
-        if won:
-            prop_won += 1
+        if won: prop_won += 1
+
+        # Placed track
+        if pb.get("placed") and pb.get("placed_stake"):
+            ps  = pb["placed_stake"]
+            po  = pb.get("best_odds", 1.0)
+            pnl = round(ps * po - ps, 2) if won else round(-ps, 2)
+            pb["placed_actual_pnl"] = pnl
+            prop_pl_staked += ps
+            prop_pl_pnl    += pnl
+            prop_pl_total  += 1
+            if won: prop_pl_won += 1
 
     # ── Settle contrarian picks ───────────────────────────────────────────────
     for cp in picks.get("contrarian_picks", []):
@@ -201,19 +232,33 @@ def run(date_str: str = None):
         "spread_accuracy":      round(spread_correct / settled, 4) if settled else None,
         "total_correct":        total_correct,
         "total_accuracy":       round(total_correct / settled, 4) if settled else None,
-        # value bets (team markets only)
-        "value_bets_total":     len(picks["value_bets"]),
-        "value_bets_won":       sum(1 for vb in picks["value_bets"] if vb.get("outcome") == "won"),
-        "value_bets_staked":    round(vb_staked, 2),
-        "value_bets_pnl":       round(vb_pnl, 2),
-        # prop bets
+        # suggested (Kelly) track — all value bets at model-suggested stakes
+        "suggested_total":      sug_total,
+        "suggested_won":        sug_won,
+        "suggested_staked":     round(sug_staked, 2),
+        "suggested_pnl":        round(sug_pnl, 2),
+        # placed (actual) track — only bets you flagged as placed
+        "placed_total":         pl_total,
+        "placed_won":           pl_won,
+        "placed_staked":        round(pl_staked, 2),
+        "placed_pnl":           round(pl_pnl, 2),
+        # props — suggested
         "prop_bets_total":      prop_total,
         "prop_bets_won":        prop_won,
         "prop_bets_staked":     round(prop_staked, 2),
         "prop_bets_pnl":        round(prop_pnl, 2),
-        # combined totals
-        "total_staked":         round(total_staked, 2),
-        "total_pnl":            round(total_pnl, 2),
+        # props — placed
+        "prop_placed_total":    prop_pl_total,
+        "prop_placed_won":      prop_pl_won,
+        "prop_placed_staked":   round(prop_pl_staked, 2),
+        "prop_placed_pnl":      round(prop_pl_pnl, 2),
+        # backwards compat fields (suggested track)
+        "value_bets_total":     sug_total,
+        "value_bets_won":       sug_won,
+        "value_bets_staked":    round(sug_staked, 2),
+        "value_bets_pnl":       round(sug_pnl, 2),
+        "total_staked":         round(sug_staked + prop_staked, 2),
+        "total_pnl":            round(sug_pnl + prop_pnl, 2),
         "updated_at":           datetime.now(timezone.utc).isoformat(),
     }
 
