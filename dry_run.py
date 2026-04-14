@@ -41,7 +41,7 @@ def run():
 
     # ── Step 1: Today's games + odds ──────────────────────────────────────────
     print("Step 1: Fetching today's games and odds...")
-    games = fetch_todays_games(odds_key)
+    games = fetch_todays_games(odds_key, bdl_api_key=bdl_key)
 
     if not games:
         print("  No NBA games today.\n")

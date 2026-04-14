@@ -136,6 +136,24 @@ def aggregate(picks: list[dict]) -> dict:
 def pct(w, t): return f"{w/t*100:.1f}%" if t else "—"
 def roi(pnl, staked): return f"{pnl/staked*100:+.1f}%" if staked else "—"
 
+def _get_chartjs() -> str:
+    """Returns Chart.js either from local cache or downloads it once."""
+    cache_path = Path("data/chart.min.js")
+    if cache_path.exists():
+        return cache_path.read_text(encoding="utf-8")
+    try:
+        import urllib.request
+        url = "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            js = r.read().decode("utf-8")
+        cache_path.parent.mkdir(exist_ok=True)
+        cache_path.write_text(js, encoding="utf-8")
+        return js
+    except Exception:
+        # Fallback: use CDN directly (works in browser, may not work in embedded view)
+        return None
+
+
 def build_html(data: dict, from_date=None, to_date=None) -> str:
     d  = data["days"]
     t  = data["totals"]
@@ -162,6 +180,13 @@ def build_html(data: dict, from_date=None, to_date=None) -> str:
     date_range = ""
     if from_date or to_date:
         date_range = f" ({from_date or '…'} → {to_date or '…'})"
+
+    # Embed Chart.js inline so it works in QWebEngineView without network access
+    _chartjs = _get_chartjs()
+    if _chartjs:
+        chartjs_tag = f"<script>\n{_chartjs}\n</script>"
+    else:
+        chartjs_tag = '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>'
 
     # daily table rows
     day_rows = ""
@@ -245,7 +270,7 @@ def build_html(data: dict, from_date=None, to_date=None) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NBA Betting Dashboard{date_range}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+{chartjs_tag}
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>

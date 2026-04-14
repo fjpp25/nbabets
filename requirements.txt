@@ -2,3 +2,5 @@ python-dotenv
 requests
 numpy
 scikit-learn
+PyQt6
+PyQt6-WebEngine

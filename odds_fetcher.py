@@ -1,7 +1,9 @@
 """
 odds_fetcher.py
-Fetches today's NBA games and bookmaker odds from The Odds API.
-Supports three markets: h2h (moneyline), spreads, and totals (over/under).
+Fetches today's NBA games and bookmaker odds.
+Primary source: The Odds API (EU region, decimal odds, Pinnacle included).
+Fallback source: balldontlie /nba/v2/odds (US books, American odds converted to decimal).
+Fallback activates automatically on 401/429 from The Odds API.
 """
 
 import requests
@@ -22,7 +24,7 @@ ET_OFFSET = timedelta(hours=-5)
 
 
 # ── Main fetcher ──────────────────────────────────────────────────────────────
-def fetch_todays_games(api_key: str, bookmakers: Optional[list[str]] = None) -> list[dict]:
+def fetch_todays_games(api_key: str, bookmakers: Optional[list[str]] = None, bdl_api_key: str = None) -> list[dict]:
     """
     Returns a list of today's NBA games with odds for all three markets.
 
@@ -67,6 +69,14 @@ def fetch_todays_games(api_key: str, bookmakers: Optional[list[str]] = None) -> 
         params["bookmakers"] = ",".join(bookmakers)
 
     response = requests.get(url, params=params, timeout=10)
+
+    # Fallback to balldontlie on auth or quota errors
+    if response.status_code in (401, 429):
+        print(f"  [Odds API] {response.status_code} — falling back to balldontlie odds")
+        if not bdl_api_key:
+            raise RuntimeError("Odds API unavailable and no BALLDONTLIE_API_KEY provided for fallback")
+        return _fetch_todays_games_bdl(bdl_api_key)
+
     response.raise_for_status()
 
     raw_games = response.json()
@@ -263,6 +273,131 @@ def pinnacle_total(game: dict) -> Optional[float]:
             return totals["Over"]["line"]
     # fallback to consensus
     return consensus_total(game)
+
+
+# ── balldontlie fallback ──────────────────────────────────────────────────────
+BDL_BASE = "https://api.balldontlie.io"
+
+
+def _american_to_decimal(american: int) -> float:
+    """Converts American odds to decimal odds."""
+    if american is None:
+        return None
+    if american > 0:
+        return round(american / 100 + 1, 4)
+    else:
+        return round(100 / abs(american) + 1, 4)
+
+
+def _fetch_todays_games_bdl(bdl_api_key: str) -> list[dict]:
+    """
+    Fallback odds source using balldontlie /nba/v2/odds.
+    Returns games in the same internal format as fetch_todays_games().
+    Note: US bookmakers only (DraftKings, FanDuel, Caesars etc).
+    No Pinnacle — edge calculations fall back to consensus.
+    """
+    today_et = (datetime.now(timezone.utc) + ET_OFFSET).date()
+    headers  = {"Authorization": bdl_api_key}
+
+    # 1. Fetch today's games from balldontlie to get team names + game IDs
+    games_resp = requests.get(
+        f"{BDL_BASE}/nba/v1/games",
+        headers=headers,
+        params={"dates[]": today_et.isoformat(), "per_page": 30},
+        timeout=10,
+    )
+    games_resp.raise_for_status()
+    bdl_games = {g["id"]: g for g in games_resp.json()["data"]
+                 if g["status"] != "Final"}
+
+    if not bdl_games:
+        print("  [balldontlie] No games found for today.")
+        return []
+
+    # 2. Fetch odds for today
+    odds_resp = requests.get(
+        f"{BDL_BASE}/nba/v2/odds",
+        headers=headers,
+        params={"dates[]": today_et.isoformat()},
+        timeout=10,
+    )
+    odds_resp.raise_for_status()
+    odds_data = odds_resp.json().get("data", [])
+
+    # Group odds by game_id
+    from collections import defaultdict
+    game_odds = defaultdict(list)
+    for odd in odds_data:
+        game_odds[odd["game_id"]].append(odd)
+
+    # 3. Build unified game dicts
+    result = []
+    for game_id, bdl_game in bdl_games.items():
+        home_team = bdl_game["home_team"]["full_name"]
+        away_team = bdl_game["visitor_team"]["full_name"]
+        commence  = bdl_game.get("datetime") or bdl_game.get("date") + "T00:00:00Z"
+
+        bookmakers = []
+        for odd in game_odds.get(game_id, []):
+            vendor = odd.get("vendor", "unknown")
+            markets = {}
+
+            # H2H (moneyline)
+            ml_home = _american_to_decimal(odd.get("moneyline_home_odds"))
+            ml_away = _american_to_decimal(odd.get("moneyline_away_odds"))
+            if ml_home and ml_away:
+                markets["h2h"] = {
+                    home_team: ml_home,
+                    away_team: ml_away,
+                }
+
+            # Spreads
+            sp_home_line = odd.get("spread_home_value")
+            sp_away_line = odd.get("spread_away_value")
+            sp_home_odds = _american_to_decimal(odd.get("spread_home_odds"))
+            sp_away_odds = _american_to_decimal(odd.get("spread_away_odds"))
+            if sp_home_line and sp_home_odds:
+                try:
+                    markets["spreads"] = {
+                        home_team: {"line": float(sp_home_line), "odds": sp_home_odds},
+                        away_team: {"line": float(sp_away_line), "odds": sp_away_odds},
+                    }
+                except (TypeError, ValueError):
+                    pass
+
+            # Totals
+            total_line = odd.get("total_value")
+            over_odds  = _american_to_decimal(odd.get("total_over_odds"))
+            under_odds = _american_to_decimal(odd.get("total_under_odds"))
+            if total_line and over_odds:
+                try:
+                    markets["totals"] = {
+                        "Over":  {"line": float(total_line), "odds": over_odds},
+                        "Under": {"line": float(total_line), "odds": under_odds},
+                    }
+                except (TypeError, ValueError):
+                    pass
+
+            if markets:
+                bookmakers.append({
+                    "key":     vendor,
+                    "title":   vendor.capitalize(),
+                    "markets": markets,
+                })
+
+        if bookmakers:
+            result.append({
+                "id":            f"bdl_{game_id}",
+                "home_team":     home_team,
+                "away_team":     away_team,
+                "commence_time": commence,
+                "bookmakers":    bookmakers,
+                "_source":       "balldontlie",
+            })
+
+    print(f"  [balldontlie] {len(result)} game(s) with odds fetched (US books, no Pinnacle)")
+    return result
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _names_match(a: str, b: str) -> bool:

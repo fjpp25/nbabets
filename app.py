@@ -298,6 +298,15 @@ class BetCard(QFrame):
         detail.setStyleSheet(f"color:{MUTED};")
         info.addWidget(detail)
 
+        # Injury alert line — only shown for H2H/spread/totals with injured players
+        inj_line = self._injury_line()
+        if inj_line:
+            inj_lbl = QLabel(inj_line)
+            inj_lbl.setFont(QFont(MONO, 9))
+            inj_lbl.setStyleSheet(f"color:{AMBER}; padding-top:2px;")
+            inj_lbl.setWordWrap(True)
+            info.addWidget(inj_lbl)
+
         lay.addLayout(info, stretch=1)
 
         # Action column
@@ -337,9 +346,39 @@ class BetCard(QFrame):
             return (f"Disagreement {abs(b.get('edge',0)):.1f} pts  ·  "
                     f"{b.get('confidence','').upper()}  ·  Kelly €{b.get('simulated_stake',0):.2f}")
         else:
-            return (f"Avg {b.get('avg',0):.1f}  ·  "
-                    f"Edge {b.get('edge_pts', b.get('edge',0)):+.1f}  ·  "
-                    f"σ={b.get('std',0):.1f}  ·  {b.get('confidence','LOW').upper()}")
+            return (f"Avg {b.get('rolling_avg', b.get('avg',0)):.1f}  ·  "
+                    f"Edge {b.get('edge', b.get('edge_pts',0)):+.1f}  ·  "
+                    f"σ={b.get('rolling_std', b.get('std',0)):.1f}  ·  {b.get('confidence','LOW').upper()}")
+
+    def _injury_line(self) -> str:
+        """Builds a compact injury summary line for display on the card."""
+        s = self.bet.get("_injury_summary")
+        if not s:
+            return ""
+
+        parts = []
+        # Home team injuries
+        for inj in s.get("home_injuries", []):
+            if inj.get("status") in ("Out", "Doubtful") and inj.get("ppg", 0) >= 5.0:
+                tier = inj["tier"].upper()
+                name = inj["player_name"].split()[-1]  # last name only for space
+                adj  = inj.get("adjustment", 0)
+                parts.append(f"{name} {inj['status']} [{tier}] {adj:+.0%}")
+        # Away team injuries
+        for inj in s.get("away_injuries", []):
+            if inj.get("status") in ("Out", "Doubtful") and inj.get("ppg", 0) >= 5.0:
+                tier = inj["tier"].upper()
+                name = inj["player_name"].split()[-1]
+                adj  = inj.get("adjustment", 0)
+                parts.append(f"{name} {inj['status']} [{tier}] {adj:+.0%}")
+
+        if not parts:
+            return ""
+
+        # Also show total pts adjustment if meaningful
+        pts_adj = s.get("total_pts_adjustment", 0.0)
+        pts_str = f"  ·  total {pts_adj:+.1f} pts" if pts_adj else ""
+        return "⚠  " + "  ·  ".join(parts[:4]) + pts_str  # cap at 4 to keep compact
 
     def _refresh_btn(self):
         if self._placed:
@@ -406,8 +445,20 @@ class BetsPanel(QScrollArea):
             self._lay.insertWidget(0, lbl)
             return
 
+        # Build injury lookup: game string → injury_summary from predictions
+        inj_lookup = {}
+        for pred in picks.get("predictions", []):
+            if pred.get("injury_affected") and pred.get("injury_summary"):
+                key = f"{pred['away_team']} @ {pred['home_team']}"
+                inj_lookup[key] = pred["injury_summary"]
+
+        # Inject injury data into value bets so cards can display it
         groups = {"h2h": [], "spread": [], "totals": [], "props": []}
-        for i, vb in enumerate(vbs):   groups[vb.get("market","h2h")].append((f"vb_{i}",   vb))
+        for i, vb in enumerate(vbs):
+            game = vb.get("game", "")
+            if game in inj_lookup:
+                vb = {**vb, "_injury_summary": inj_lookup[game]}
+            groups[vb.get("market","h2h")].append((f"vb_{i}", vb))
         for i, pb in enumerate(props): groups["props"].append((f"prop_{i}", pb))
 
         pos = 0
@@ -471,6 +522,7 @@ class App(QMainWindow):
         self._build()
         self._refresh_stats()
         self._load_todays_bets()
+        self._load_dashboard()
         t = QTimer(self); t.timeout.connect(self._tick); t.start(1000); self._tick()
 
     # ── Layout ────────────────────────────────────────────────────────────────
